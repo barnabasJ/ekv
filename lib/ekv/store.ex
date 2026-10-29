@@ -279,6 +279,12 @@ defmodule EKV.Store do
       )
       """)
 
+    :ok =
+      EKV.Sqlite3.execute(db, """
+      CREATE INDEX IF NOT EXISTS idx_kv_paxos_gc_candidates ON kv_paxos(key)
+      WHERE accepted_counter = 0 AND promised_counter = 0
+      """)
+
     # Migration for existing dev databases — add value columns if missing
     for {col, type} <- [
           {"accepted_value", "BLOB"},
@@ -335,6 +341,10 @@ defmodule EKV.Store do
     # Validate/startup guards — must never silently open incompatible data.
     validate_schema_version(db, data_dir, shard_index)
     validate_num_shards(db, num_shards, data_dir, shard_index)
+
+    # Reconcile legacy orphan references before serving writes. Normal replay
+    # truncation cleans its candidates; hard deletes clean newly orphaned keys.
+    :ok = purge_orphan_keyrefs(db)
 
     # Mark as active
     touch_last_active(db)
@@ -987,14 +997,15 @@ defmodule EKV.Store do
         WHERE expires_at IS NOT NULL
           AND expires_at < ?1
           AND deleted_at IS NULL
-          AND key IN (SELECT key FROM kv_paxos)
+          AND EXISTS (SELECT 1 FROM kv_paxos WHERE kv_paxos.key = kv.key)
         """)
 
       :ok = EKV.Sqlite3.bind(del_stmt, [cutoff])
       :done = EKV.Sqlite3.step(db, del_stmt)
       :ok = EKV.Sqlite3.release(db, del_stmt)
 
-      purge_orphan_keyrefs(db)
+      if sqlite_changes(db) > 0, do: purge_orphan_keyrefs(db)
+      :ok
     end)
   end
 
@@ -1012,7 +1023,8 @@ defmodule EKV.Store do
       :done = EKV.Sqlite3.step(db, del_stmt)
       :ok = EKV.Sqlite3.release(db, del_stmt)
 
-      purge_orphan_keyrefs(db)
+      if sqlite_changes(db) > 0, do: purge_orphan_keyrefs(db)
+      :ok
     end)
   end
 
